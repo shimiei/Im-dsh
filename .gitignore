@@ -1,0 +1,16 @@
+# 构建产物（不入库，release.sh 随时重新生成）
+dist/
+build/
+Payload/
+IMDSH.app/
+*.o
+*.d
+*.ipa
+*.xcuserstate
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+
+# 本机协议探测产物（含真实会话内容与本机路径，不入库）
+docs/protocol-notes/

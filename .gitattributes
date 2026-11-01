@@ -1,0 +1,14 @@
+# 统一换行：仓库内一律 LF。
+# 这些脚本要在 WSL / Linux / GitHub Actions 里跑，CRLF 会让 bash 报 "$'\r': command not found"。
+* text=auto eol=lf
+
+# 明确按二进制处理，避免被当成文本改动
+*.png binary
+*.ipa binary
+*.jpg binary
+*.gif binary
+*.pdf binary
+
+# Windows 批处理保持 CRLF（将来若加）
+*.cmd text eol=crlf
+*.bat text eol=crlf
