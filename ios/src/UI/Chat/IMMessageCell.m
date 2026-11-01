@@ -2,6 +2,11 @@
 //  IMMessageCell.m
 //  IMDSH — 消息单元格
 //
+//  视觉按即时通讯软件（Telegram / LINE）的通行做法：
+//  - 自己右对齐、强调色气泡；助手左对齐、浅色气泡 + 小头像
+//  - 连续同一发送者的消息成组：组内间距 2pt、组间 10pt，头像和时间只在组尾出现
+//  - 气泡 18pt 连续圆角，最大宽度 86%
+//
 
 #import "IMMessageCell.h"
 #import "IMTheme.h"
@@ -13,8 +18,31 @@
 /// 流式输出时跟在正文末尾的光标。
 static NSString *const IMStreamCursor = @" ▍";
 
+static const CGFloat IMAvatarSize = 26;
+static const CGFloat IMBubbleRadius = 18;
+static const CGFloat IMSideInset = 12;
+static const CGFloat IMAvatarGap = 8;
+static const CGFloat IMBubbleMaxWidthRatio = 0.86;
+static const CGFloat IMGroupGapOuter = 10;
+static const CGFloat IMGroupGapInner = 2;
+
+/// 气泡里的时间戳统一走这里，避免每处各建一个 NSDateFormatter。
+static NSString *IMMessageTimeString(NSTimeInterval seconds) {
+    if (seconds <= 0) return @"";
+    static NSDateFormatter *formatter;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        formatter = [[NSDateFormatter alloc] init];
+        formatter.dateFormat = @"HH:mm";
+        formatter.locale = [NSLocale localeWithLocaleIdentifier:@"zh_Hans_CN"];
+    });
+    return [formatter stringFromDate:[NSDate dateWithTimeIntervalSince1970:seconds]];
+}
+
 @interface IMMessageCell () <IMMarkdownContentViewDelegate>
 
+@property (nonatomic, strong) UIView *avatarView;
+@property (nonatomic, strong) UIImageView *avatarIconView;
 @property (nonatomic, strong) UIView *bubble;
 @property (nonatomic, strong) UIStackView *contentStack;
 @property (nonatomic, strong) IMMarkdownContentView *markdownView;
@@ -23,9 +51,14 @@ static NSString *const IMStreamCursor = @" ▍";
 @property (nonatomic, strong) IMTodoCardView *todoView;
 @property (nonatomic, strong) IMNoticeBarView *noticeView;
 @property (nonatomic, strong) UIStackView *attachmentStack;
+@property (nonatomic, strong) UILabel *metaLabel;
 
 @property (nonatomic, strong) NSLayoutConstraint *alignLeftConstraint;
 @property (nonatomic, strong) NSLayoutConstraint *alignRightConstraint;
+@property (nonatomic, strong) NSLayoutConstraint *topPadConstraint;
+@property (nonatomic, strong) NSLayoutConstraint *bottomPadConstraint;
+@property (nonatomic, strong) NSLayoutConstraint *avatarTopConstraint;
+
 /// attachmentId → 对应的缩略图视图（缩略图异步回来时按 id 找回）。
 @property (nonatomic, strong) NSMutableDictionary<NSString *, UIImageView *> *thumbnailViews;
 
@@ -50,9 +83,25 @@ static NSString *const IMStreamCursor = @" ▍";
     self.selectionStyle = UITableViewCellSelectionStyleNone;
     _thumbnailViews = [NSMutableDictionary dictionary];
 
+    // 头像：助手侧的小圆标（自己发的消息不画头像，和主流 IM 一致）。
+    _avatarView = [[UIView alloc] init];
+    _avatarView.translatesAutoresizingMaskIntoConstraints = NO;
+    _avatarView.backgroundColor = [theme.accentColor colorWithAlphaComponent:0.16];
+    _avatarView.layer.cornerRadius = IMAvatarSize / 2.0;
+    _avatarView.layer.cornerCurve = kCACornerCurveContinuous;
+    _avatarView.clipsToBounds = YES;
+    _avatarView.userInteractionEnabled = NO;
+    [self.contentView addSubview:_avatarView];
+
+    _avatarIconView = [[UIImageView alloc] initWithImage:IMSymbol(@"sparkles", 13, UIImageSymbolWeightSemibold)];
+    _avatarIconView.translatesAutoresizingMaskIntoConstraints = NO;
+    _avatarIconView.tintColor = theme.accentColor;
+    _avatarIconView.contentMode = UIViewContentModeCenter;
+    [_avatarView addSubview:_avatarIconView];
+
     _bubble = [[UIView alloc] init];
     _bubble.translatesAutoresizingMaskIntoConstraints = NO;
-    _bubble.layer.cornerRadius = theme.radiusLarge;
+    _bubble.layer.cornerRadius = IMBubbleRadius;
     _bubble.layer.cornerCurve = kCACornerCurveContinuous;
     _bubble.clipsToBounds = YES;
     [self.contentView addSubview:_bubble];
@@ -60,8 +109,9 @@ static NSString *const IMStreamCursor = @" ▍";
     _contentStack = [[UIStackView alloc] init];
     _contentStack.translatesAutoresizingMaskIntoConstraints = NO;
     _contentStack.axis = UILayoutConstraintAxisVertical;
-    _contentStack.spacing = 8;
+    _contentStack.spacing = 6;
     _contentStack.layoutMarginsRelativeArrangement = YES;
+    _contentStack.layoutMargins = UIEdgeInsetsMake(8, 12, 8, 12);
     [_bubble addSubview:_contentStack];
 
     _attachmentStack = [[UIStackView alloc] init];
@@ -79,7 +129,12 @@ static NSString *const IMStreamCursor = @" ▍";
     _todoView = [[IMTodoCardView alloc] initWithFrame:CGRectZero];
     _noticeView = [[IMNoticeBarView alloc] initWithFrame:CGRectZero];
 
-    for (UIView *view in @[_attachmentStack, _reasoningView, _markdownView, _toolStack, _todoView, _noticeView]) {
+    _metaLabel = [[UILabel alloc] init];
+    _metaLabel.font = [IMTheme fontCaption];
+    _metaLabel.textColor = theme.labelTertiary;
+    _metaLabel.numberOfLines = 1;
+
+    for (UIView *view in @[_attachmentStack, _reasoningView, _markdownView, _toolStack, _todoView, _noticeView, _metaLabel]) {
         [_contentStack addArrangedSubview:view];
     }
 
@@ -89,15 +144,29 @@ static NSString *const IMStreamCursor = @" ▍";
     _todoView.onHeightChange = ^{ [weakSelf notifyHeightChange]; };
     _todoView.onToggle = ^(BOOL expanded) { weakSelf.item.todosExpanded = expanded; };
 
-    _alignLeftConstraint = [_bubble.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:theme.spacingM];
-    _alignRightConstraint = [_bubble.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-theme.spacingM];
+    _topPadConstraint = [_bubble.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:IMGroupGapOuter];
+    _bottomPadConstraint = [_bubble.bottomAnchor constraintEqualToAnchor:self.contentView.bottomAnchor constant:-IMGroupGapOuter];
+    _avatarTopConstraint = [_avatarView.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:IMGroupGapOuter + 2];
+
+    // 左右两种贴边方式，按发送者切换。
+    _alignLeftConstraint = [_bubble.leadingAnchor constraintEqualToAnchor:_avatarView.trailingAnchor constant:IMAvatarGap];
+    _alignRightConstraint = [_bubble.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-IMSideInset];
+    _alignRightConstraint.active = YES;
 
     [NSLayoutConstraint activateConstraints:@[
-        [_bubble.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:theme.spacingXS],
-        [_bubble.bottomAnchor constraintEqualToAnchor:self.contentView.bottomAnchor constant:-theme.spacingXS],
-        [_bubble.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.contentView.leadingAnchor constant:theme.spacingM],
-        [_bubble.trailingAnchor constraintLessThanOrEqualToAnchor:self.contentView.trailingAnchor constant:-theme.spacingM],
-        [_bubble.widthAnchor constraintLessThanOrEqualToAnchor:self.contentView.widthAnchor multiplier:0.88],
+        [_avatarView.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:IMSideInset],
+        [_avatarView.widthAnchor constraintEqualToConstant:IMAvatarSize],
+        [_avatarView.heightAnchor constraintEqualToConstant:IMAvatarSize],
+        _avatarTopConstraint,
+
+        [_avatarIconView.centerXAnchor constraintEqualToAnchor:_avatarView.centerXAnchor],
+        [_avatarIconView.centerYAnchor constraintEqualToAnchor:_avatarView.centerYAnchor],
+
+        _topPadConstraint,
+        _bottomPadConstraint,
+        [_bubble.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.contentView.leadingAnchor constant:IMSideInset],
+        [_bubble.trailingAnchor constraintLessThanOrEqualToAnchor:self.contentView.trailingAnchor constant:-IMSideInset],
+        [_bubble.widthAnchor constraintLessThanOrEqualToAnchor:self.contentView.widthAnchor multiplier:IMBubbleMaxWidthRatio],
 
         [_contentStack.topAnchor constraintEqualToAnchor:_bubble.topAnchor],
         [_contentStack.leadingAnchor constraintEqualToAnchor:_bubble.leadingAnchor],
@@ -115,10 +184,19 @@ static NSString *const IMStreamCursor = @" ▍";
 #pragma mark - 配置
 
 - (void)configureWithItem:(IMMessageItem *)item {
+    [self configureWithItem:item showAvatar:YES showTime:YES firstInGroup:YES lastInGroup:YES];
+}
+
+- (void)configureWithItem:(IMMessageItem *)item
+               showAvatar:(BOOL)showAvatar
+                 showTime:(BOOL)showTime
+             firstInGroup:(BOOL)firstInGroup
+              lastInGroup:(BOOL)lastInGroup {
     IMTheme *theme = IMTheme.shared;
+    self.item = item;
+
     if (item == nil) {
         // 兜底：IMMessageItemKindUser 是 0，nil 会被当成「用户消息」画出空气泡。
-        self.item = nil;
         [self configureAttachments:@[]];
         [self configureToolCalls:@[]];
         self.reasoningView.hidden = YES;
@@ -126,17 +204,37 @@ static NSString *const IMStreamCursor = @" ▍";
         [self.markdownView renderNodes:@[]];
         self.todoView.hidden = YES;
         self.noticeView.hidden = YES;
+        self.metaLabel.hidden = YES;
+        self.avatarView.hidden = YES;
         return;
     }
-    self.item = item;
 
     BOOL isUser = item.kind == IMMessageItemKindUser;
+    BOOL isNotice = item.kind == IMMessageItemKindNotice;
+
     self.alignLeftConstraint.active = !isUser;
     self.alignRightConstraint.active = isUser;
 
-    // 用户消息：accent 淡底气泡；助手消息：无底色，只有极轻的内边距。
-    self.bubble.backgroundColor = isUser ? [theme.accentColor colorWithAlphaComponent:0.16] : UIColor.clearColor;
-    self.contentStack.layoutMargins = isUser ? UIEdgeInsetsMake(10, 13, 10, 13) : UIEdgeInsetsMake(4, 0, 4, 0);
+    // 组内紧凑、组间留白：这是「看起来像 IM」最关键的一步。
+    CGFloat topPad = firstInGroup ? IMGroupGapOuter : IMGroupGapInner;
+    CGFloat bottomPad = lastInGroup ? IMGroupGapOuter : IMGroupGapInner;
+    self.topPadConstraint.constant = topPad;
+    self.bottomPadConstraint.constant = -bottomPad;
+    self.avatarTopConstraint.constant = topPad + 2;
+
+    self.avatarView.hidden = !(showAvatar && !isUser && !isNotice);
+
+    // 气泡底色：自己 = 强调色淡底；助手 = 极浅中性底（原来助手完全透明，读起来像一片裸文本）。
+    if (isUser) {
+        self.bubble.backgroundColor = [theme.accentColor colorWithAlphaComponent:0.18];
+    } else if (isNotice) {
+        self.bubble.backgroundColor = UIColor.clearColor;
+    } else {
+        self.bubble.backgroundColor = [theme.labelPrimary colorWithAlphaComponent:0.055];
+    }
+    self.contentStack.layoutMargins = isNotice
+        ? UIEdgeInsetsMake(2, 0, 2, 0)
+        : UIEdgeInsetsMake(8, 12, 8, 12);
 
     [self configureAttachments:item.attachments];
 
@@ -156,8 +254,7 @@ static NSString *const IMStreamCursor = @" ▍";
         if (isUser) {
             [self.markdownView renderPlainText:text];
         } else if (item.streaming) {
-            // 流式期间走增量渲染：老代码每个 delta 都拿全文当 cache key 整篇重解析，
-            // 长回答时 CPU/内存平方增长、缓存爆掉，越聊越卡。
+            // 流式期间走增量渲染：整篇重解析会让长回答的 CPU/内存平方增长。
             [self.markdownView renderStreamingMarkdown:text];
         } else {
             // 收尾帧：整篇正式渲染一次，得到最终排版。
@@ -179,6 +276,12 @@ static NSString *const IMStreamCursor = @" ▍";
     if (item.notice.length > 0) {
         [self.noticeView configureWithText:item.notice isError:item.noticeIsError];
     }
+
+    // 时间戳：只在组尾显示，右发靠右、左发靠左。
+    NSString *timeText = showTime ? IMMessageTimeString(item.time) : @"";
+    self.metaLabel.text = timeText;
+    self.metaLabel.hidden = timeText.length == 0;
+    self.metaLabel.textAlignment = isUser ? NSTextAlignmentRight : NSTextAlignmentLeft;
 }
 
 - (void)configureAttachments:(NSArray<IMAttachmentRef *> *)attachments {

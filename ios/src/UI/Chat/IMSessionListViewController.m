@@ -1,156 +1,69 @@
 //
 //  IMSessionListViewController.m
-//  IMDSH — 会话列表
+//  IMDSH — 会话列表（按项目分组 / 折叠 / 显示更多 / 搜索扁平化）
+//
+//  数据形状：session/list 一次返回 475 条，其中 382 条是 subagent 子会话（服务层已过滤），
+//  剩下的 89 条顶层会话分布在 19 个 cwd 里，最大的项目占 49 条。扁平列表既长又难找，
+//  所以这里做三件事：
+//    1) 按 projectKey（cwd 原值）分组，每组一个吸顶表头；
+//    2) 表头可点折叠，折叠状态按 projectKey 持久化到 NSUserDefaults；
+//    3) 每组默认只放 5 条，超出部分收进「显示更多（还有 N 条）」，点一次 +10 条。
+//  搜索激活时切回扁平结果：分组 + 折叠会把命中项藏起来，等于没搜到。
+//
+//  表结构：非搜索态 section = 分组；搜索态 section = 1（扁平）。
+//  行的位置（首/中/末）决定卡片圆角，同组多行拼成一张连续卡片。
 //
 
 #import "IMSessionListViewController.h"
+#import "IMSessionListCells.h"
+#import "IMSessionGroupHeaderView.h"
 #import "IMTheme.h"
 #import "IMGlass.h"
 #import "IMFormatting.h"
 #import "IMChatService.h"
 #import "IMServerStore.h"
 
-#pragma mark - 行
+#pragma mark - 常量
 
-/// 路径尾段（Windows 反斜杠也要认）。
-static NSString *IMPathTail(NSString *path);
-
-@interface IMSessionRowCell : UITableViewCell
-@property (nonatomic, strong) UILabel *titleLabel;
-@property (nonatomic, strong) UILabel *subtitleLabel;
-@property (nonatomic, strong) UILabel *badgeLabel;
-@property (nonatomic, strong) UIView *runningDot;
-- (void)configureWithRow:(IMSessionRow *)row;
-@end
-
-@interface IMSessionRowCell ()
-@property (nonatomic, strong) NSLayoutConstraint *indentConstraint;
-@property (nonatomic, strong) NSLayoutConstraint *badgeWidthConstraint;
-@end
-
-@implementation IMSessionRowCell
-
-- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
-    self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
-    if (self) {
-        IMTheme *theme = IMTheme.shared;
-        self.backgroundColor = UIColor.clearColor;
-        self.contentView.backgroundColor = UIColor.clearColor;
-        self.selectedBackgroundView = [[UIView alloc] init];
-        self.selectedBackgroundView.backgroundColor = theme.backgroundLayer2;
-
-        _titleLabel = [[UILabel alloc] init];
-        _titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-        _titleLabel.textColor = theme.labelPrimary;
-        _titleLabel.numberOfLines = 1;
-        _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-        _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-
-        _badgeLabel = [[UILabel alloc] init];
-        _badgeLabel.font = [IMTheme fontCaption];
-        _badgeLabel.textColor = theme.labelTertiary;
-        _badgeLabel.text = @"子会话";
-        _badgeLabel.translatesAutoresizingMaskIntoConstraints = NO;
-        [_badgeLabel setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-        [_badgeLabel setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-
-        _runningDot = [[UIView alloc] init];
-        _runningDot.translatesAutoresizingMaskIntoConstraints = NO;
-        _runningDot.layer.cornerRadius = 3.5;
-        _runningDot.backgroundColor = theme.accentColor;
-        _runningDot.hidden = YES;
-
-        _subtitleLabel = [[UILabel alloc] init];
-        _subtitleLabel.font = [IMTheme fontFootnote];
-        _subtitleLabel.textColor = theme.labelTertiary;
-        _subtitleLabel.numberOfLines = 1;
-        _subtitleLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        _subtitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-
-        [self.contentView addSubview:_runningDot];
-        [self.contentView addSubview:_titleLabel];
-        [self.contentView addSubview:_badgeLabel];
-        [self.contentView addSubview:_subtitleLabel];
-
-        _indentConstraint = [_titleLabel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:theme.spacingL];
-        _badgeWidthConstraint = [_badgeLabel.widthAnchor constraintEqualToConstant:0];
-
-        [NSLayoutConstraint activateConstraints:@[
-            _indentConstraint,
-            [_titleLabel.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:10],
-            [_titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:_badgeLabel.leadingAnchor constant:-6],
-
-            [_badgeLabel.centerYAnchor constraintEqualToAnchor:_titleLabel.centerYAnchor],
-            [_badgeLabel.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-theme.spacingL],
-            _badgeWidthConstraint,
-
-            [_runningDot.centerYAnchor constraintEqualToAnchor:_titleLabel.centerYAnchor],
-            [_runningDot.trailingAnchor constraintLessThanOrEqualToAnchor:_badgeLabel.leadingAnchor constant:-6],
-            [_runningDot.widthAnchor constraintEqualToConstant:7],
-            [_runningDot.heightAnchor constraintEqualToConstant:7],
-
-            [_subtitleLabel.topAnchor constraintEqualToAnchor:_titleLabel.bottomAnchor constant:2],
-            [_subtitleLabel.leadingAnchor constraintEqualToAnchor:_titleLabel.leadingAnchor],
-            [_subtitleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.contentView.trailingAnchor constant:-theme.spacingL],
-            [_subtitleLabel.bottomAnchor constraintEqualToAnchor:self.contentView.bottomAnchor constant:-10],
-        ]];
-    }
-    return self;
-}
-
-- (void)configureWithRow:(IMSessionRow *)row {
-    IMTheme *theme = IMTheme.shared;
-    self.titleLabel.text = [row displayTitle];
-
-    // 子会话：缩进 + 弱化，和父会话区分开。
-    self.indentConstraint.constant = row.isSubagent ? theme.spacingXL + theme.spacingS : theme.spacingL;
-    self.titleLabel.textColor = row.isSubagent ? theme.labelSecondary : theme.labelPrimary;
-    self.titleLabel.font = [UIFont systemFontOfSize:row.isSubagent ? 14 : 15 weight:row.isSubagent ? UIFontWeightRegular : UIFontWeightSemibold];
-    self.badgeLabel.hidden = !row.isSubagent;
-    self.badgeWidthConstraint.constant = row.isSubagent ? 42 : 0;
-
-    NSMutableArray<NSString *> *parts = [NSMutableArray array];
-    if (row.updatedAt > 0) [parts addObject:IMRelativeTimeString([NSDate dateWithTimeIntervalSince1970:row.updatedAt])];
-    if (row.tokenCount > 0) [parts addObject:[NSString stringWithFormat:@"%@ tokens", IMTokenCountString(row.tokenCount)]];
-    if (row.cwd.length > 0) [parts addObject:IMPathTail(row.cwd)];
-    self.subtitleLabel.text = [parts componentsJoinedByString:@" · "];
-
-    self.runningDot.hidden = !row.running;
-    if (row.running) {
-        [self.runningDot.layer removeAnimationForKey:@"imdsh.breath"];
-        CABasicAnimation *animation = [CABasicAnimation animationWithKeyPath:@"opacity"];
-        animation.fromValue = @(1.0);
-        animation.toValue = @(0.25);
-        animation.duration = 1.1;
-        animation.autoreverses = YES;
-        animation.repeatCount = HUGE_VALF;
-        [self.runningDot.layer addAnimation:animation forKey:@"imdsh.breath"];
-    }
-}
-
-/// 路径尾段（Windows 反斜杠也要认）。
-static NSString *IMPathTail(NSString *path) {
-    NSString *trimmed = [path stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/\\"]];
-    NSRange slash = [trimmed rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"/\\"] options:NSBackwardsSearch];
-    return slash.location == NSNotFound ? trimmed : [trimmed substringFromIndex:NSMaxRange(slash)];
-}
-
-@end
+/// 每组默认展示条数。
+static const NSInteger IMSessionListDefaultVisibleCount = 5;
+/// 点一次「显示更多」多展示几条。
+static const NSInteger IMSessionListShowMoreStep = 10;
+/// 吸顶表头高度。
+static const CGFloat IMSessionListGroupHeaderHeight = 40;
+/// 折叠状态持久化：外层 key 固定，内层 key 就是 projectKey（cwd 原值，空串 = 未知项目）。
+static NSString * const IMSessionListCollapsedDefaultsKey = @"imdsh.session.list.collapsedProjects";
+static NSString * const IMSessionListRowCellIdentifier = @"IMSessionListRowCell";
+static NSString * const IMSessionListMoreCellIdentifier = @"IMSessionListShowMoreCell";
 
 #pragma mark - 列表
 
 @interface IMSessionListViewController () <UITableViewDataSource, UITableViewDelegate, UISearchResultsUpdating, UISearchControllerDelegate>
+
+// 视图
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIRefreshControl *refreshControl;
 @property (nonatomic, strong) UIView *stateView;
 @property (nonatomic, strong) UIImageView *stateIconView;
 @property (nonatomic, strong) UILabel *stateLabel;
 @property (nonatomic, strong) IMGlassButton *stateButton;
+/// iPad / 宽屏时把列表收窄，避免拉成一条超宽行。
+@property (nonatomic, strong) NSLayoutConstraint *tableWidthCapConstraint;
 
+// 数据
 @property (nonatomic, strong) IMChatService *service;
+/// 全部顶层会话（权威顺序：运行中置顶，其余 updatedAt 倒序）。
 @property (nonatomic, strong) NSMutableArray<IMSessionRow *> *rows;
-/// 搜索命中的行（未搜索时等于 rows）。
+/// 分组结果（非搜索态用；组内 updatedAt 倒序、组间按最新时间倒序）。
+@property (nonatomic, strong) NSArray<IMSessionGroup *> *groups;
+/// 搜索命中的行（扁平，不分组、不折叠）。
 @property (nonatomic, strong) NSArray<IMSessionRow *> *filteredRows;
+/// projectKey → 当前每组展示条数（内存，不持久化）。
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *visibleCounts;
+/// projectKey → 折叠标记（持久化到 NSUserDefaults）。
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *collapsedProjects;
+
+// 搜索 / 分页 / 状态
 @property (nonatomic, strong) UISearchController *searchController;
 @property (nonatomic, copy, nullable) NSString *nextCursor;
 @property (nonatomic, assign) BOOL isLoading;
@@ -163,6 +76,7 @@ static NSString *IMPathTail(NSString *path) {
 @property (nonatomic, assign) BOOL activityRefreshScheduled;
 @property (nonatomic, copy, nullable) NSString *loadErrorText;
 @property (nonatomic, assign) BOOL needsPairing;
+
 @end
 
 @implementation IMSessionListViewController
@@ -171,7 +85,12 @@ static NSString *IMPathTail(NSString *path) {
     self = [super init];
     if (self) {
         _rows = [NSMutableArray array];
+        _groups = @[];
+        _filteredRows = @[];
+        _visibleCounts = [NSMutableDictionary dictionary];
+        _collapsedProjects = [NSMutableDictionary dictionary];
         _service = [[IMChatService alloc] init];
+        [self loadCollapsedState];
     }
     return self;
 }
@@ -190,8 +109,14 @@ static NSString *IMPathTail(NSString *path) {
     self.tableView.delegate = self;
     self.tableView.rowHeight = UITableViewAutomaticDimension;
     self.tableView.estimatedRowHeight = 62;
-    self.tableView.contentInset = UIEdgeInsetsMake(4, 0, theme.spacingXL, 0);
-    [self.tableView registerClass:IMSessionRowCell.class forCellReuseIdentifier:@"IMSessionRowCell"];
+    // 分组表头自己带高度，关掉系统给分组补的额外上间距，避免组与组之间空一大块。
+    self.tableView.estimatedSectionHeaderHeight = 0;
+    self.tableView.sectionFooterHeight = 0;
+    self.tableView.sectionHeaderTopPadding = 0;
+    self.tableView.contentInset = UIEdgeInsetsMake(theme.spacingS, 0, theme.spacingXL, 0);
+    self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    [self.tableView registerClass:IMSessionListRowCell.class forCellReuseIdentifier:IMSessionListRowCellIdentifier];
+    [self.tableView registerClass:IMSessionListShowMoreCell.class forCellReuseIdentifier:IMSessionListMoreCellIdentifier];
     [self.view addSubview:self.tableView];
 
     self.refreshControl = [[UIRefreshControl alloc] init];
@@ -200,11 +125,19 @@ static NSString *IMPathTail(NSString *path) {
 
     [self buildStateView];
 
+    // 宽度上限：iPhone / iPad 分栏里不生效，整屏 iPad 时把列表收窄并居中。
+    NSLayoutConstraint *leading = [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor];
+    leading.priority = UILayoutPriorityRequired - 1;
+    NSLayoutConstraint *trailing = [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor];
+    trailing.priority = UILayoutPriorityRequired - 1;
+    self.tableWidthCapConstraint = [self.tableView.widthAnchor constraintLessThanOrEqualToConstant:[theme maxContentWidthForSize:self.view.bounds.size]];
     [NSLayoutConstraint activateConstraints:@[
         [self.tableView.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
-        [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [self.tableView.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        self.tableWidthCapConstraint,
+        leading,
+        trailing,
     ]];
 
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithImage:IMSymbol(@"arrow.clockwise", 15, UIImageSymbolWeightSemibold)
@@ -216,6 +149,52 @@ static NSString *IMPathTail(NSString *path) {
     [self startControlStream];
     [self reloadSessions];
     [self startObserving];
+}
+
+- (void)viewWillLayoutSubviews {
+    [super viewWillLayoutSubviews];
+    CGFloat cap = [IMTheme.shared maxContentWidthForSize:self.view.bounds.size];
+    if (cap > 0 && fabs(self.tableWidthCapConstraint.constant - cap) > 0.5) {
+        self.tableWidthCapConstraint.constant = cap;
+    }
+}
+
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+    [self.service stopControlStream];
+}
+
+#pragma mark - 折叠状态持久化
+
+- (void)loadCollapsedState {
+    id stored = [NSUserDefaults.standardUserDefaults objectForKey:IMSessionListCollapsedDefaultsKey];
+    if (![stored isKindOfClass:NSDictionary.class]) return;
+    // 存的是 {projectKey: @YES}；读回来只认字符串 key + 数字 value，别的直接丢掉。
+    for (id key in (NSDictionary *)stored) {
+        if (![key isKindOfClass:NSString.class]) continue;
+        id value = ((NSDictionary *)stored)[key];
+        if (![value isKindOfClass:NSNumber.class]) continue;
+        if ([(NSNumber *)value boolValue]) self.collapsedProjects[(NSString *)key] = @YES;
+    }
+}
+
+- (void)persistCollapsedState {
+    [NSUserDefaults.standardUserDefaults setObject:[self.collapsedProjects copy] forKey:IMSessionListCollapsedDefaultsKey];
+}
+
+- (BOOL)isProjectCollapsed:(NSString *)projectKey {
+    NSNumber *flag = self.collapsedProjects[projectKey ?: @""];
+    return flag.boolValue;
+}
+
+- (void)setProjectCollapsed:(BOOL)collapsed forKey:(NSString *)projectKey {
+    NSString *key = projectKey ?: @"";
+    if (collapsed) {
+        self.collapsedProjects[key] = @YES;
+    } else {
+        [self.collapsedProjects removeObjectForKey:key];
+    }
+    [self persistCollapsedState];
 }
 
 #pragma mark - 搜索
@@ -240,10 +219,6 @@ static NSString *IMPathTail(NSString *path) {
     return self.searchController.isActive;
 }
 
-- (NSArray<IMSessionRow *> *)visibleRows {
-    return [self isFiltering] ? self.filteredRows : self.rows;
-}
-
 - (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
     [self applyFilterWithQuery:searchController.searchBar.text];
 }
@@ -259,11 +234,13 @@ static NSString *IMPathTail(NSString *path) {
     } else {
         NSMutableArray<IMSessionRow *> *matches = [NSMutableArray array];
         for (IMSessionRow *row in self.rows) {
-            // 标题 + cwd 尾段本地过滤；数据本来就都在 session/list 里，不需要远程搜索接口。
+            // 标题 + 项目名 + 完整 cwd 本地过滤；数据本来就都在 session/list 里，不需要远程搜索接口。
             NSString *title = [row displayTitle] ?: @"";
-            NSString *cwdTail = row.cwd.length > 0 ? IMPathTail(row.cwd) : @"";
+            NSString *projectName = row.projectName ?: @"";
+            NSString *cwd = row.cwd ?: @"";
             if ([title localizedCaseInsensitiveContainsString:keyword] ||
-                [cwdTail localizedCaseInsensitiveContainsString:keyword]) {
+                [projectName localizedCaseInsensitiveContainsString:keyword] ||
+                [cwd localizedCaseInsensitiveContainsString:keyword]) {
                 [matches addObject:row];
             }
         }
@@ -273,10 +250,7 @@ static NSString *IMPathTail(NSString *path) {
     [self updateStateView];
 }
 
-- (void)dealloc {
-    [NSNotificationCenter.defaultCenter removeObserver:self];
-    [self.service stopControlStream];
-}
+#pragma mark - 通知
 
 - (void)startObserving {
     self.lastPairingSignature = [self currentPairingSignature];
@@ -369,9 +343,14 @@ static NSString *IMPathTail(NSString *path) {
     ]];
 }
 
+/// 有内容可看 = 有会话（分组折叠成只剩表头也算有内容，此时不该弹空态）。
+- (BOOL)hasListContent {
+    return [self isFiltering] ? self.filteredRows.count > 0 : self.rows.count > 0;
+}
+
 - (void)updateStateView {
     BOOL filtering = [self isFiltering];
-    BOOL showsState = [self visibleRows].count == 0;
+    BOOL showsState = ![self hasListContent];
     self.stateView.hidden = !showsState;
     if (!showsState) return;
 
@@ -451,12 +430,11 @@ static NSString *IMPathTail(NSString *path) {
         self.nextCursor = nextCursor;
         self.lastReloadTime = NSDate.date.timeIntervalSince1970;
         [self applyRows:rows ?: @[]];
-        [self updateStateView];
     }];
 }
 
 - (void)applyRows:(NSArray<IMSessionRow *> *)rows {
-    // 运行中的会话置顶，其余按更新时间倒序；搜索过滤沿用同一顺序。
+    // 运行中的会话置顶，其余按更新时间倒序；分组内部再由 IMSessionGroup 按 updatedAt 倒序。
     NSArray<IMSessionRow *> *sorted = [rows sortedArrayUsingComparator:^NSComparisonResult(IMSessionRow *lhs, IMSessionRow *rhs) {
         if (lhs.running != rhs.running) return lhs.running ? NSOrderedAscending : NSOrderedDescending;
         if (lhs.updatedAt == rhs.updatedAt) return [lhs.sessionId compare:rhs.sessionId];
@@ -464,12 +442,24 @@ static NSString *IMPathTail(NSString *path) {
     }];
     [self.rows setArray:sorted];
 
+    [self rebuildGroups];
+
     if ([self isFiltering]) {
         [self applyFilterWithQuery:self.searchController.searchBar.text];
     } else {
         self.filteredRows = self.rows;
         [self.tableView reloadData];
+        [self updateStateView];
     }
+}
+
+/// 重建分组，并把持久化的折叠状态贴回去（分组对象每次都是新的）。
+- (void)rebuildGroups {
+    NSArray<IMSessionGroup *> *groups = [IMSessionGroup groupsFromRows:self.rows];
+    for (IMSessionGroup *group in groups) {
+        group.collapsed = [self isProjectCollapsed:group.projectKey];
+    }
+    self.groups = groups;
 }
 
 - (void)handleRefresh {
@@ -477,11 +467,9 @@ static NSString *IMPathTail(NSString *path) {
 }
 
 - (void)noteSessionActivity:(NSString *)sessionId {
-    NSUInteger index = [self.rows indexOfObjectPassingTest:^BOOL(IMSessionRow *row, NSUInteger idx, BOOL *stop) {
-        return [row.sessionId isEqualToString:sessionId];
-    }];
-    if (index == NSNotFound) return;
-    self.rows[index].updatedAt = [NSDate date].timeIntervalSince1970;
+    IMSessionRow *row = [self rowWithSessionId:sessionId];
+    if (row == nil) return;
+    row.updatedAt = [NSDate date].timeIntervalSince1970;
 
     // 一条消息会带来多帧事件：合并成一次刷新，否则 iPad 双列同屏时列表疯狂跳动、点不中行。
     if (self.activityRefreshScheduled) return;
@@ -519,6 +507,223 @@ static NSString *IMPathTail(NSString *path) {
     }];
 }
 
+#pragma mark - 分组辅助
+
+- (nullable IMSessionRow *)rowWithSessionId:(NSString *)sessionId {
+    if (sessionId.length == 0) return nil;
+    NSUInteger index = [self.rows indexOfObjectPassingTest:^BOOL(IMSessionRow *row, NSUInteger idx, BOOL *stop) {
+        return [row.sessionId isEqualToString:sessionId];
+    }];
+    return index == NSNotFound ? nil : self.rows[index];
+}
+
+- (nullable IMSessionGroup *)groupAtSection:(NSInteger)section {
+    if (section < 0 || section >= (NSInteger)self.groups.count) return nil;
+    return self.groups[(NSUInteger)section];
+}
+
+- (NSInteger)sectionForProjectKey:(NSString *)projectKey {
+    for (NSInteger index = 0; index < (NSInteger)self.groups.count; index++) {
+        if ([self.groups[(NSUInteger)index].projectKey isEqualToString:projectKey]) return index;
+    }
+    return -1;
+}
+
+/// 该组当前展示多少条（默认 5，点「显示更多」+10，上限是组内总数）。
+- (NSInteger)visibleCountForGroup:(IMSessionGroup *)group {
+    NSNumber *stored = self.visibleCounts[group.projectKey ?: @""];
+    NSInteger wanted = stored != nil ? stored.integerValue : IMSessionListDefaultVisibleCount;
+    if (wanted < IMSessionListDefaultVisibleCount) wanted = IMSessionListDefaultVisibleCount;
+    NSInteger total = (NSInteger)group.rows.count;
+    return wanted > total ? total : wanted;
+}
+
+/// 只有超过默认条数的组才需要末尾那一行「显示更多 / 收起」。
+- (BOOL)groupHasMoreRow:(IMSessionGroup *)group {
+    return (NSInteger)group.rows.count > IMSessionListDefaultVisibleCount;
+}
+
+- (NSInteger)runningCountForGroup:(IMSessionGroup *)group {
+    NSInteger running = 0;
+    for (IMSessionRow *row in group.rows) {
+        if (row.running) running++;
+    }
+    return running;
+}
+
+- (NSInteger)numberOfRowsForSection:(NSInteger)section {
+    if ([self isFiltering]) return (NSInteger)self.filteredRows.count;
+    IMSessionGroup *group = [self groupAtSection:section];
+    if (group == nil || group.collapsed) return 0;
+    return [self visibleCountForGroup:group] + ([self groupHasMoreRow:group] ? 1 : 0);
+}
+
+/// 行在卡片里的位置：首行圆上角、末行圆下角、中间直角，整组拼成一张卡片。
+- (IMSessionListCellPosition)positionForIndexPath:(NSIndexPath *)indexPath {
+    NSInteger rowCount = [self numberOfRowsForSection:indexPath.section];
+    if (rowCount <= 1) return IMSessionListCellPositionSingle;
+    if (indexPath.row <= 0) return IMSessionListCellPositionTop;
+    if (indexPath.row >= rowCount - 1) return IMSessionListCellPositionBottom;
+    return IMSessionListCellPositionMiddle;
+}
+
+/// 该行是不是「显示更多 / 收起」那一行。
+- (BOOL)isShowMoreIndexPath:(NSIndexPath *)indexPath {
+    if ([self isFiltering]) return NO;
+    IMSessionGroup *group = [self groupAtSection:indexPath.section];
+    if (group == nil || group.collapsed) return NO;
+    if (![self groupHasMoreRow:group]) return NO;
+    return indexPath.row == [self visibleCountForGroup:group];
+}
+
+- (nullable IMSessionRow *)rowAtIndexPath:(NSIndexPath *)indexPath {
+    if ([self isFiltering]) {
+        if (indexPath.row < 0 || indexPath.row >= (NSInteger)self.filteredRows.count) return nil;
+        return self.filteredRows[(NSUInteger)indexPath.row];
+    }
+    IMSessionGroup *group = [self groupAtSection:indexPath.section];
+    if (group == nil || group.collapsed) return nil;
+    if (indexPath.row < 0 || indexPath.row >= [self visibleCountForGroup:group]) return nil;
+    if (indexPath.row >= (NSInteger)group.rows.count) return nil;
+    return group.rows[(NSUInteger)indexPath.row];
+}
+
+/// 会话行当前所在的 indexPath；被折叠或被「显示更多」藏起来时返回 nil。
+- (nullable NSIndexPath *)indexPathForRow:(IMSessionRow *)row {
+    if ([self isFiltering]) {
+        NSUInteger index = [self.filteredRows indexOfObjectIdenticalTo:row];
+        if (index == NSNotFound) return nil;
+        return [NSIndexPath indexPathForRow:(NSInteger)index inSection:0];
+    }
+    for (NSInteger section = 0; section < (NSInteger)self.groups.count; section++) {
+        IMSessionGroup *group = self.groups[(NSUInteger)section];
+        if (group.collapsed) continue;
+        NSUInteger index = [group.rows indexOfObjectIdenticalTo:row];
+        if (index == NSNotFound) continue;
+        if ((NSInteger)index >= [self visibleCountForGroup:group]) return nil;
+        return [NSIndexPath indexPathForRow:(NSInteger)index inSection:section];
+    }
+    return nil;
+}
+
+#pragma mark - 折叠 / 显示更多
+
+/// 点表头：折叠或展开一个项目。行用批量插入/删除，箭头同时旋转。
+- (void)toggleGroupWithKey:(NSString *)projectKey {
+    NSInteger section = [self sectionForProjectKey:projectKey];
+    if (section < 0) return;
+    IMSessionGroup *group = self.groups[(NSUInteger)section];
+    BOOL collapsing = !group.collapsed;
+
+    // 折叠前后要增删的行数（与折叠状态无关，只跟展示条数有关）。
+    NSInteger rowCount = [self visibleCountForGroup:group] + ([self groupHasMoreRow:group] ? 1 : 0);
+
+    group.collapsed = collapsing;
+    [self setProjectCollapsed:collapsing forKey:projectKey];
+
+    UIView *header = [self.tableView headerViewForSection:section];
+    if ([header isKindOfClass:IMSessionGroupHeaderView.class]) {
+        [(IMSessionGroupHeaderView *)header setCollapsed:collapsing animated:YES];
+    }
+
+    if (rowCount > 0) {
+        NSMutableArray<NSIndexPath *> *paths = [NSMutableArray arrayWithCapacity:(NSUInteger)rowCount];
+        for (NSInteger row = 0; row < rowCount; row++) {
+            [paths addObject:[NSIndexPath indexPathForRow:row inSection:section]];
+        }
+        [self.tableView beginUpdates];
+        if (collapsing) {
+            [self.tableView deleteRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
+        } else {
+            [self.tableView insertRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
+        }
+        [self.tableView endUpdates];
+    }
+    [self updateStateView];
+}
+
+/// 点「显示更多」：+10 条；已经全展开时点「收起」：退回默认 5 条。
+- (void)handleShowMoreAtSection:(NSInteger)section {
+    IMSessionGroup *group = [self groupAtSection:section];
+    if (group == nil) return;
+    NSInteger total = (NSInteger)group.rows.count;
+    NSInteger visible = [self visibleCountForGroup:group];
+    NSInteger target;
+    if (visible >= total) {
+        target = MIN(IMSessionListDefaultVisibleCount, total);
+    } else {
+        target = MIN(total, visible + IMSessionListShowMoreStep);
+    }
+    if (target == visible) return;
+
+    self.visibleCounts[group.projectKey ?: @""] = @(target);
+
+    NSInteger delta = target - visible;
+    NSInteger step = delta > 0 ? delta : -delta;
+    NSMutableArray<NSIndexPath *> *paths = [NSMutableArray arrayWithCapacity:(NSUInteger)step];
+    if (delta > 0) {
+        for (NSInteger row = visible; row < target; row++) {
+            [paths addObject:[NSIndexPath indexPathForRow:row inSection:section]];
+        }
+    } else {
+        for (NSInteger row = target; row < visible; row++) {
+            [paths addObject:[NSIndexPath indexPathForRow:row inSection:section]];
+        }
+    }
+
+    [self.tableView beginUpdates];
+    if (delta > 0) {
+        [self.tableView insertRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
+    } else {
+        [self.tableView deleteRowsAtIndexPaths:paths withRowAnimation:UITableViewRowAnimationFade];
+    }
+    [self.tableView endUpdates];
+
+    // 首尾行换了：圆角要重算；「显示更多」那一行要换文案。
+    [self refreshCardPositionsInSection:section];
+    [self refreshShowMoreCellInSection:section];
+}
+
+- (void)refreshCardPositionsInSection:(NSInteger)section {
+    for (NSIndexPath *path in self.tableView.indexPathsForVisibleRows) {
+        if (path.section != section) continue;
+        UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:path];
+        IMSessionListCellPosition position = [self positionForIndexPath:path];
+        if ([cell isKindOfClass:IMSessionListRowCell.class]) {
+            [(IMSessionListRowCell *)cell applyCardPosition:position];
+        } else if ([cell isKindOfClass:IMSessionListShowMoreCell.class]) {
+            [(IMSessionListShowMoreCell *)cell applyCardPosition:position];
+        }
+    }
+}
+
+- (void)refreshShowMoreCellInSection:(NSInteger)section {
+    IMSessionGroup *group = [self groupAtSection:section];
+    if (group == nil || group.collapsed || ![self groupHasMoreRow:group]) return;
+    NSIndexPath *path = [NSIndexPath indexPathForRow:[self visibleCountForGroup:group] inSection:section];
+    UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:path];
+    if (![cell isKindOfClass:IMSessionListShowMoreCell.class]) return;
+    NSInteger hidden = (NSInteger)group.rows.count - [self visibleCountForGroup:group];
+    [(IMSessionListShowMoreCell *)cell configureWithHiddenCount:hidden position:[self positionForIndexPath:path]];
+}
+
+#pragma mark - 选中态
+
+- (void)setSelectedSessionId:(nullable NSString *)selectedSessionId {
+    _selectedSessionId = [selectedSessionId copy];
+    [self refreshCurrentSessionAppearance];
+}
+
+- (void)refreshCurrentSessionAppearance {
+    for (NSIndexPath *path in self.tableView.indexPathsForVisibleRows) {
+        UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:path];
+        if (![cell isKindOfClass:IMSessionListRowCell.class]) continue;
+        IMSessionRow *row = [self rowAtIndexPath:path];
+        BOOL current = row != nil && self.selectedSessionId.length > 0 && [row.sessionId isEqualToString:self.selectedSessionId];
+        [(IMSessionListRowCell *)cell setCurrentSession:current];
+    }
+}
+
 #pragma mark - 投影流（实时标题 / 用量）
 
 - (void)startControlStream {
@@ -526,65 +731,121 @@ static NSString *IMPathTail(NSString *path) {
     [self.service startControlStreamWithHandler:^(NSString *sessionId, NSString *key, id value) {
         __strong typeof(weakSelf) self = weakSelf;
         if (self == nil) return;
-        if (![key isEqualToString:@"title"] && ![key isEqualToString:@"tokenUsage"] && ![key isEqualToString:@"sessionListMetadata"]) return;
 
-        NSUInteger index = [self.rows indexOfObjectPassingTest:^BOOL(IMSessionRow *row, NSUInteger idx, BOOL *stop) {
-            return [row.sessionId isEqualToString:sessionId];
-        }];
-        if (index == NSNotFound) return;
+        BOOL isTitle = [key isEqualToString:@"title"];
+        BOOL isUsage = [key isEqualToString:@"tokenUsage"];
+        if (!isTitle && !isUsage) return;
 
-        IMSessionRow *row = self.rows[index];
-        if ([key isEqualToString:@"title"] && [value isKindOfClass:NSString.class]) {
-            if ([row.title isEqualToString:value]) return;
-            row.title = value;
-        } else if ([key isEqualToString:@"tokenUsage"] && [value isKindOfClass:NSDictionary.class]) {
-            // 投影值可能是 null：直接 integerValue 会在 NSNull 上抛 unrecognized selector。
+        IMSessionRow *row = [self rowWithSessionId:sessionId];
+        if (row == nil) return;
+
+        if (isTitle) {
+            // 投影值可能是 null：不校验类型直接当 NSString 用会撞 unrecognized selector。
+            if (![value isKindOfClass:NSString.class]) return;
+            if ([row.title isEqualToString:(NSString *)value]) return;
+            row.title = (NSString *)value;
+        } else {
+            if (![value isKindOfClass:NSDictionary.class]) return;
             id rawInput = ((NSDictionary *)value)[@"uncachedInputTokens"];
             id rawOutput = ((NSDictionary *)value)[@"outputTokens"];
             NSInteger input = [rawInput isKindOfClass:NSNumber.class] ? [(NSNumber *)rawInput integerValue] : 0;
             NSInteger output = [rawOutput isKindOfClass:NSNumber.class] ? [(NSNumber *)rawOutput integerValue] : 0;
             if (row.tokenCount == input + output) return;
             row.tokenCount = input + output;
-        } else {
-            return;
         }
 
-        NSIndexPath *path = [NSIndexPath indexPathForRow:(NSInteger)index inSection:0];
         // 正在输入搜索词时不动表格：焦点与列表 diff 分开处理，避免打断打字。
         if ([self isFiltering]) return;
-        if ([[self.tableView indexPathsForVisibleRows] containsObject:path]) {
-            [self.tableView reloadRowsAtIndexPaths:@[path] withRowAnimation:UITableViewRowAnimationNone];
-        }
+        NSIndexPath *path = [self indexPathForRow:row];
+        if (path == nil) return;
+        if (![[self.tableView indexPathsForVisibleRows] containsObject:path]) return;
+        [self.tableView reloadRowsAtIndexPaths:@[path] withRowAnimation:UITableViewRowAnimationNone];
     }];
 }
 
-#pragma mark - UITableView
+#pragma mark - UITableViewDataSource
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return (NSInteger)[self visibleRows].count;
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    // 搜索态是扁平结果，只有一个 section（也就没有分组表头）。
+    if ([self isFiltering]) return 1;
+    return (NSInteger)self.groups.count;
 }
 
-- (nullable IMSessionRow *)rowAtIndexPath:(NSIndexPath *)indexPath {
-    NSArray<IMSessionRow *> *rows = [self visibleRows];
-    if (indexPath.row < 0 || indexPath.row >= (NSInteger)rows.count) return nil;
-    return rows[(NSUInteger)indexPath.row];
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return [self numberOfRowsForSection:section];
+}
+
+- (nullable UIView *)tableView:(UITableView *)tableView viewForHeaderInSection:(NSInteger)section {
+    if ([self isFiltering]) return nil;
+    IMSessionGroup *group = [self groupAtSection:section];
+    if (group == nil) return nil;
+
+    IMSessionGroupHeaderView *header = [[IMSessionGroupHeaderView alloc] initWithFrame:CGRectMake(0, 0, tableView.bounds.size.width, IMSessionListGroupHeaderHeight)];
+    [header updateWithProjectName:group.projectName
+                     sessionCount:(NSInteger)group.rows.count
+                     runningCount:[self runningCountForGroup:group]
+                        collapsed:group.collapsed
+                         animated:NO];
+
+    __weak typeof(self) weakSelf = self;
+    NSString *key = group.projectKey ?: @"";
+    header.onToggle = ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (self == nil) return;
+        [self toggleGroupWithKey:key];
+    };
+    return header;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
+    return [self isFiltering] ? 0 : IMSessionListGroupHeaderHeight;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    IMSessionRowCell *cell = [tableView dequeueReusableCellWithIdentifier:@"IMSessionRowCell" forIndexPath:indexPath];
+    IMSessionListCellPosition position = [self positionForIndexPath:indexPath];
+
+    if ([self isShowMoreIndexPath:indexPath]) {
+        IMSessionListShowMoreCell *cell = [tableView dequeueReusableCellWithIdentifier:IMSessionListMoreCellIdentifier forIndexPath:indexPath];
+        IMSessionGroup *group = [self groupAtSection:indexPath.section];
+        NSInteger visible = [self visibleCountForGroup:group];
+        NSInteger hidden = (NSInteger)group.rows.count - visible;
+        [cell configureWithHiddenCount:hidden position:position];
+        return cell;
+    }
+
+    IMSessionListRowCell *cell = [tableView dequeueReusableCellWithIdentifier:IMSessionListRowCellIdentifier forIndexPath:indexPath];
     IMSessionRow *row = [self rowAtIndexPath:indexPath];
-    if (row != nil) [cell configureWithRow:row];
+    BOOL current = row != nil && self.selectedSessionId.length > 0 && [row.sessionId isEqualToString:self.selectedSessionId];
+    if (row != nil) {
+        [cell configureWithRow:row position:position isCurrent:current];
+    }
     return cell;
 }
 
+#pragma mark - UITableViewDelegate
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
+
+    if ([self isShowMoreIndexPath:indexPath]) {
+        [self handleShowMoreAtSection:indexPath.section];
+        return;
+    }
+
     IMSessionRow *row = [self rowAtIndexPath:indexPath];
     if (row == nil) return;
     self.selectedSessionId = row.sessionId;
     if ([self.delegate respondsToSelector:@selector(sessionListViewController:didSelectRow:)]) {
         [self.delegate sessionListViewController:self didSelectRow:row];
     }
+}
+
+- (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
+    // 分组后最后一屏可能凑不满一屏高度，光靠 scrollViewDidScroll 触发不到翻页。
+    if ([self isFiltering]) return;
+    if (indexPath.section != (NSInteger)self.groups.count - 1) return;
+    NSInteger rowCount = [self numberOfRowsForSection:indexPath.section];
+    if (rowCount > 0 && indexPath.row >= rowCount - 1) [self loadMoreIfNeeded];
 }
 
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {

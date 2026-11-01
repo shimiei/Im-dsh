@@ -29,6 +29,14 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)configureWithItem:(IMMessageItem *)item;
 
+/// 分组感知的配置：连续同一发送者的消息共享头像/时间戳，并压缩组内间距。
+/// showAvatar 一般只在「组尾」为 YES；showTime 同理（即时通讯软件的通行做法）。
+- (void)configureWithItem:(nullable IMMessageItem *)item
+               showAvatar:(BOOL)showAvatar
+                 showTime:(BOOL)showTime
+             firstInGroup:(BOOL)firstInGroup
+              lastInGroup:(BOOL)lastInGroup;
+
 @end
 
 NS_ASSUME_NONNULL_END

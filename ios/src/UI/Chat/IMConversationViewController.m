@@ -118,9 +118,113 @@ static const CGFloat IMStickToBottomThreshold = 90;
 
 @end
 
+#pragma mark - 展示行 / 日期分隔
+
+/// 展示行：把 transcript.items 摊平成「消息 + 日期分隔」，并带上分组信息。
+typedef NS_ENUM(NSInteger, IMConversationRowKind) {
+    IMConversationRowKindMessage = 0,
+    IMConversationRowKindDaySeparator,
+};
+
+@interface IMConversationRow : NSObject
+@property (nonatomic, assign) IMConversationRowKind kind;
+@property (nonatomic, strong, nullable) IMMessageItem *item;
+@property (nonatomic, copy, nullable) NSString *dayText;
+@property (nonatomic, assign) BOOL showAvatar;
+@property (nonatomic, assign) BOOL showTime;
+@property (nonatomic, assign) BOOL firstInGroup;
+@property (nonatomic, assign) BOOL lastInGroup;
+@end
+
+@implementation IMConversationRow
+@end
+
+/// 居中的日期胶囊（今天 / 昨天 / 3月1日）。
+@interface IMDaySeparatorCell : UITableViewCell
+- (void)configureWithText:(NSString *)text;
+@end
+
+@interface IMDaySeparatorCell ()
+@property (nonatomic, strong) UILabel *pill;
+@end
+
+@implementation IMDaySeparatorCell
+
+- (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
+    self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
+    if (self) {
+        self.backgroundColor = UIColor.clearColor;
+        self.contentView.backgroundColor = UIColor.clearColor;
+        self.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        _pill = [[UILabel alloc] init];
+        _pill.translatesAutoresizingMaskIntoConstraints = NO;
+        _pill.font = [IMTheme fontCaption];
+        _pill.textColor = IMTheme.shared.labelTertiary;
+        _pill.textAlignment = NSTextAlignmentCenter;
+        _pill.backgroundColor = [IMTheme.shared.labelPrimary colorWithAlphaComponent:0.06];
+        _pill.layer.cornerRadius = 10;
+        _pill.layer.cornerCurve = kCACornerCurveContinuous;
+        _pill.clipsToBounds = YES;
+        [self.contentView addSubview:_pill];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [_pill.centerXAnchor constraintEqualToAnchor:self.contentView.centerXAnchor],
+            [_pill.topAnchor constraintEqualToAnchor:self.contentView.topAnchor constant:8],
+            [_pill.bottomAnchor constraintEqualToAnchor:self.contentView.bottomAnchor constant:-4],
+            [_pill.heightAnchor constraintEqualToConstant:20],
+            [_pill.widthAnchor constraintGreaterThanOrEqualToConstant:56],
+        ]];
+    }
+    return self;
+}
+
+- (void)configureWithText:(NSString *)text {
+    self.pill.text = [NSString stringWithFormat:@"  %@  ", text ?: @""];
+}
+
+@end
+
+/// 同一发送者、同一天、间隔小于这个秒数，算同一组。
+static const NSTimeInterval IMGroupMaxGap = 300;
+
+static NSString *IMDayTextForTime(NSTimeInterval seconds) {
+    if (seconds <= 0) return @"";
+    NSDate *date = [NSDate dateWithTimeIntervalSince1970:seconds];
+    NSCalendar *calendar = [NSCalendar currentCalendar];
+    if ([calendar isDateInToday:date]) return @"今天";
+    if ([calendar isDateInYesterday:date]) return @"昨天";
+    static NSDateFormatter *formatter;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        formatter = [[NSDateFormatter alloc] init];
+        formatter.locale = [NSLocale localeWithLocaleIdentifier:@"zh_Hans_CN"];
+        formatter.dateFormat = @"M月d日";
+    });
+    return [formatter stringFromDate:date];
+}
+
+static BOOL IMSameDay(NSTimeInterval lhs, NSTimeInterval rhs) {
+    if (lhs <= 0 || rhs <= 0) return lhs == rhs;
+    NSCalendar *calendar = [NSCalendar currentCalendar];
+    return [calendar isDate:[NSDate dateWithTimeIntervalSince1970:lhs]
+        inSameDayAsDate:[NSDate dateWithTimeIntervalSince1970:rhs]];
+}
+
+static BOOL IMCanGroupTogether(IMMessageItem *lhs, IMMessageItem *rhs) {
+    if (lhs == nil || rhs == nil) return NO;
+    BOOL lhsUser = lhs.kind == IMMessageItemKindUser;
+    BOOL rhsUser = rhs.kind == IMMessageItemKindUser;
+    if (lhsUser != rhsUser) return NO;
+    // 提示条是独立的一行，不参与分组。
+    if (lhs.kind == IMMessageItemKindNotice || rhs.kind == IMMessageItemKindNotice) return NO;
+    if (!IMSameDay(lhs.time, rhs.time)) return NO;
+    return fabs(lhs.time - rhs.time) <= IMGroupMaxGap;
+}
+
 #pragma mark - 聊天页
 
-@interface IMConversationViewController () <UITableViewDataSource, IMMessageCellDelegate, IMComposerViewDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate, PHPickerViewControllerDelegate>
+@interface IMConversationViewController () <UITableViewDataSource, UITableViewDelegate, IMMessageCellDelegate, IMComposerViewDelegate, UIImagePickerControllerDelegate, UINavigationControllerDelegate, PHPickerViewControllerDelegate>
 
 @property (nonatomic, strong) IMChatService *service;
 @property (nonatomic, strong) IMChatTranscript *transcript;
@@ -149,6 +253,14 @@ static const CGFloat IMStickToBottomThreshold = 90;
 @property (nonatomic, strong) NSMutableArray<IMImageAttachment *> *pendingImages;
 /// 会话级图片上限，来自 projections.values.imageLimits。
 @property (nonatomic, strong) IMImageLimits *imageLimits;
+
+/// 摊平后的展示行（消息 + 日期分隔），表格直接用它。
+@property (nonatomic, strong) NSMutableArray<IMConversationRow *> *displayRows;
+/// 离开底部时出现的「回到底部」按钮。
+@property (nonatomic, strong) UIButton *scrollToBottomButton;
+@property (nonatomic, strong) UILabel *unreadBadge;
+@property (nonatomic, assign) NSInteger unreadCount;
+@property (nonatomic, assign) CGFloat lastHeaderWidth;
 @end
 
 @implementation IMConversationViewController
@@ -161,6 +273,7 @@ static const CGFloat IMStickToBottomThreshold = 90;
         _transcript = [[IMChatTranscript alloc] init];
         _pendingImages = [NSMutableArray array];
         _imageLimits = [IMImageLimits defaultLimits];
+        _displayRows = [NSMutableArray array];
     }
     return self;
 }
@@ -186,6 +299,15 @@ static const CGFloat IMStickToBottomThreshold = 90;
     [self.service closeSessionStream];
 }
 
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    // 表头宽度随旋转/分屏变化时补一次，避免停在旧的 0 宽度上。
+    CGFloat width = self.tableView.bounds.size.width;
+    if (self.historyHeader != nil && width > 0 && fabs(width - self.lastHeaderWidth) > 0.5) {
+        [self updateHistoryHeader];
+    }
+}
+
 #pragma mark - 界面
 
 - (void)buildInterface {
@@ -196,11 +318,15 @@ static const CGFloat IMStickToBottomThreshold = 90;
     self.tableView.backgroundColor = UIColor.clearColor;
     self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
     self.tableView.dataSource = self;
+    // 以前只设了 dataSource，delegate 从来没赋值 —— scrollViewDidScroll: / isNearBottom /
+    // loadOlderMessages 全都是死代码，上滑永远翻不出更早的消息。
+    self.tableView.delegate = self;
     self.tableView.rowHeight = UITableViewAutomaticDimension;
     self.tableView.estimatedRowHeight = 120;
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
     self.tableView.contentInset = UIEdgeInsetsMake(6, 0, theme.spacingM, 0);
     [self.tableView registerClass:IMMessageCell.class forCellReuseIdentifier:@"IMMessageCell"];
+    [self.tableView registerClass:IMDaySeparatorCell.class forCellReuseIdentifier:@"IMDaySeparatorCell"];
     [self.view addSubview:self.tableView];
 
     self.emptyLabel = [[UILabel alloc] init];
@@ -260,10 +386,13 @@ static const CGFloat IMStickToBottomThreshold = 90;
         [self.composer.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
         [self.composer.widthAnchor constraintLessThanOrEqualToConstant:780],
     ]];
-    // 手机竖屏时铺满安全区（优先级低一点，宽屏由 maxContentWidth 收窄居中）。
-    NSLayoutConstraint *composerLeading = [self.composer.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:theme.spacingM];
-    composerLeading.priority = UILayoutPriorityDefaultHigh;
-    composerLeading.active = YES;
+    // 手机竖屏铺满安全区；iPad 上被 780 上限收窄后居中。
+    // 全部 required，宽度用低优先级等式补：原来那条 priority 750 的 leading 等式
+    // 会和「宽度 ≤ 780」在首次布局（bounds 还是 0）时互相打，刷一屏 unsatisfiable。
+    NSLayoutConstraint *composerWidth = [self.composer.widthAnchor constraintEqualToAnchor:safe.widthAnchor
+                                                                                constant:-theme.spacingM * 2];
+    composerWidth.priority = UILayoutPriorityDefaultHigh;
+    composerWidth.active = YES;
 
     // 输入区贴键盘：keyboardLayoutGuide 在键盘收起时等于安全区底部，不需要手写通知偏移。
     NSLayoutConstraint *composerBottom = [self.composer.bottomAnchor constraintEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor constant:-theme.spacingS];
@@ -273,6 +402,49 @@ static const CGFloat IMStickToBottomThreshold = 90;
         [self.emptyLabel.centerXAnchor constraintEqualToAnchor:self.tableView.centerXAnchor],
         [self.emptyLabel.centerYAnchor constraintEqualToAnchor:self.tableView.centerYAnchor constant:-30],
         [self.emptyLabel.widthAnchor constraintLessThanOrEqualToConstant:280],
+    ]];
+
+    // 回到底部：离开底部时出现，有新消息时带未读数。
+    self.scrollToBottomButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.scrollToBottomButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.scrollToBottomButton setImage:IMSymbol(@"chevron.down", 15, UIImageSymbolWeightSemibold)
+                               forState:UIControlStateNormal];
+    self.scrollToBottomButton.tintColor = theme.labelPrimary;
+    self.scrollToBottomButton.backgroundColor = theme.backgroundLayer2;
+    self.scrollToBottomButton.layer.cornerRadius = 20;
+    self.scrollToBottomButton.layer.cornerCurve = kCACornerCurveContinuous;
+    self.scrollToBottomButton.layer.shadowColor = UIColor.blackColor.CGColor;
+    self.scrollToBottomButton.layer.shadowOpacity = 0.12;
+    self.scrollToBottomButton.layer.shadowRadius = 8;
+    self.scrollToBottomButton.layer.shadowOffset = CGSizeMake(0, 2);
+    self.scrollToBottomButton.hidden = YES;
+    [self.scrollToBottomButton addTarget:self
+                                  action:@selector(scrollToBottomTapped)
+                        forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.scrollToBottomButton];
+
+    self.unreadBadge = [[UILabel alloc] init];
+    self.unreadBadge.translatesAutoresizingMaskIntoConstraints = NO;
+    self.unreadBadge.font = [UIFont systemFontOfSize:10 weight:UIFontWeightSemibold];
+    self.unreadBadge.textColor = UIColor.whiteColor;
+    self.unreadBadge.textAlignment = NSTextAlignmentCenter;
+    self.unreadBadge.backgroundColor = theme.accentColor;
+    self.unreadBadge.layer.cornerRadius = 8;
+    self.unreadBadge.layer.cornerCurve = kCACornerCurveContinuous;
+    self.unreadBadge.clipsToBounds = YES;
+    self.unreadBadge.hidden = YES;
+    [self.scrollToBottomButton addSubview:self.unreadBadge];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.scrollToBottomButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-16],
+        [self.scrollToBottomButton.bottomAnchor constraintEqualToAnchor:self.composer.topAnchor constant:-10],
+        [self.scrollToBottomButton.widthAnchor constraintEqualToConstant:40],
+        [self.scrollToBottomButton.heightAnchor constraintEqualToConstant:40],
+
+        [self.unreadBadge.centerXAnchor constraintEqualToAnchor:self.scrollToBottomButton.trailingAnchor constant:-2],
+        [self.unreadBadge.centerYAnchor constraintEqualToAnchor:self.scrollToBottomButton.topAnchor constant:2],
+        [self.unreadBadge.heightAnchor constraintEqualToConstant:16],
+        [self.unreadBadge.widthAnchor constraintGreaterThanOrEqualToConstant:16],
     ]];
 
     self.composer.hidden = !self.service.isPaired;
@@ -389,6 +561,7 @@ static const CGFloat IMStickToBottomThreshold = 90;
 
     self.reconnectBar.hidden = YES;
     self.reconnectBarHeight.constant = 0;
+    [self rebuildDisplayRows];
     [self.tableView reloadData];
     self.lastRenderedItemCount = (NSInteger)self.transcript.items.count;
     [self updateHistoryHeader];
@@ -412,10 +585,17 @@ static const CGFloat IMStickToBottomThreshold = 90;
     if (![self.transcript appendRecord:record]) return;
 
     if (self.transcript.items.count != previousCount) {
+        [self rebuildDisplayRows];
         [self.tableView reloadData];
         self.lastRenderedItemCount = (NSInteger)self.transcript.items.count;
         [self updateEmptyState];
-        if (self.stickToBottom) [self scrollToBottomAnimated:YES];
+        if (self.stickToBottom) {
+            [self scrollToBottomAnimated:YES];
+        } else {
+            // 没贴底就是用户在翻历史：只累计未读，不抢滚动位置。
+            self.unreadCount += 1;
+            [self updateScrollToBottomButton];
+        }
         if (self.onSessionActivity) self.onSessionActivity();
     } else {
         [self refreshLastItem];
@@ -428,6 +608,7 @@ static const CGFloat IMStickToBottomThreshold = 90;
     NSUInteger currentCount = self.transcript.items.count;
     if ((NSInteger)currentCount != self.lastRenderedItemCount) {
         self.lastRenderedItemCount = (NSInteger)currentCount;
+        [self rebuildDisplayRows];
         [self.tableView reloadData];
         if (self.stickToBottom) [self scrollToBottomAnimated:NO];
     }
@@ -449,16 +630,21 @@ static const CGFloat IMStickToBottomThreshold = 90;
 }
 
 - (void)flushStreamingItem {
-    NSInteger index = [self.transcript indexOfStreamingItem];
-    if (index < 0) return;
+    IMMessageItem *item = self.transcript.streamingItem;
+    if (item == nil) return;
+    NSInteger index = [self displayIndexForItem:item];
+    if (index < 0 || index >= (NSInteger)self.displayRows.count) return;
     NSIndexPath *path = [NSIndexPath indexPathForRow:index inSection:0];
-    if (index >= (NSInteger)self.transcript.items.count) return;
 
-    IMMessageItem *item = self.transcript.items[(NSUInteger)index];
     BOOL wasStick = self.stickToBottom;
     IMMessageCell *cell = (IMMessageCell *)[self.tableView cellForRowAtIndexPath:path];
+    IMConversationRow *row = self.displayRows[(NSUInteger)index];
     if (cell != nil) {
-        [cell configureWithItem:item];
+        [cell configureWithItem:row.item
+                     showAvatar:row.showAvatar
+                       showTime:row.showTime
+                   firstInGroup:row.firstInGroup
+                    lastInGroup:row.lastInGroup];
         // 自撑高 cell 原地更新后需要重算行高，否则打字机效果会把内容裁掉。
         [UIView performWithoutAnimation:^{
             [self.tableView beginUpdates];
@@ -471,13 +657,21 @@ static const CGFloat IMStickToBottomThreshold = 90;
 }
 
 - (void)refreshLastItem {
-    NSInteger index = (NSInteger)self.transcript.items.count - 1;
+    NSInteger index = (NSInteger)self.displayRows.count - 1;
+    while (index >= 0 && self.displayRows[(NSUInteger)index].kind != IMConversationRowKindMessage) {
+        index -= 1;
+    }
     if (index < 0) return;
     NSIndexPath *path = [NSIndexPath indexPathForRow:index inSection:0];
     BOOL wasStick = self.stickToBottom;
     IMMessageCell *cell = (IMMessageCell *)[self.tableView cellForRowAtIndexPath:path];
     if (cell != nil) {
-        [cell configureWithItem:self.transcript.items[(NSUInteger)index]];
+        IMConversationRow *row = self.displayRows[(NSUInteger)index];
+        [cell configureWithItem:row.item
+                     showAvatar:row.showAvatar
+                       showTime:row.showTime
+                   firstInGroup:row.firstInGroup
+                    lastInGroup:row.lastInGroup];
         [UIView performWithoutAnimation:^{
             [self.tableView beginUpdates];
             [self.tableView endUpdates];
@@ -519,6 +713,74 @@ static const CGFloat IMStickToBottomThreshold = 90;
     self.emptyLabel.hidden = !empty;
 }
 
+#pragma mark - 展示行
+
+/// 把 transcript.items 摊平成「日期分隔 + 消息」，并算好分组边界。
+/// O(n) 且只在数据变化时跑，比在 cellForRow 里现算邻居安全得多。
+- (void)rebuildDisplayRows {
+    NSArray<IMMessageItem *> *items = self.transcript.items;
+    [self.displayRows removeAllObjects];
+
+    NSString *currentDay = nil;
+    NSUInteger count = items.count;
+    for (NSUInteger index = 0; index < count; index++) {
+        IMMessageItem *item = items[index];
+
+        NSString *day = IMDayTextForTime(item.time);
+        if (day.length > 0 && ![day isEqualToString:currentDay ?: @""]) {
+            IMConversationRow *separator = [IMConversationRow new];
+            separator.kind = IMConversationRowKindDaySeparator;
+            separator.dayText = day;
+            [self.displayRows addObject:separator];
+            currentDay = day;
+        }
+
+        IMMessageItem *previous = index > 0 ? items[index - 1] : nil;
+        IMMessageItem *next = index + 1 < count ? items[index + 1] : nil;
+        BOOL joinsPrevious = IMCanGroupTogether(previous, item);
+        BOOL joinsNext = IMCanGroupTogether(item, next);
+
+        IMConversationRow *row = [IMConversationRow new];
+        row.kind = IMConversationRowKindMessage;
+        row.item = item;
+        row.firstInGroup = !joinsPrevious;
+        row.lastInGroup = !joinsNext;
+        // 头像和时间戳只画在组尾，这是主流 IM 的通行做法。
+        row.showTime = row.lastInGroup;
+        row.showAvatar = row.lastInGroup;
+        [self.displayRows addObject:row];
+    }
+}
+
+- (NSInteger)displayIndexForItem:(IMMessageItem *)item {
+    if (item == nil) return -1;
+    for (NSUInteger index = 0; index < self.displayRows.count; index++) {
+        IMConversationRow *row = self.displayRows[index];
+        if (row.kind == IMConversationRowKindMessage && row.item == item) return (NSInteger)index;
+    }
+    return -1;
+}
+
+- (void)updateScrollToBottomButton {
+    BOOL shouldShow = !self.stickToBottom && self.displayRows.count > 0;
+    self.scrollToBottomButton.hidden = !shouldShow;
+    if (self.unreadCount > 0) {
+        self.unreadBadge.hidden = NO;
+        self.unreadBadge.text = self.unreadCount > 99
+            ? @"99+"
+            : [NSString stringWithFormat:@"%ld", (long)self.unreadCount];
+    } else {
+        self.unreadBadge.hidden = YES;
+    }
+}
+
+- (void)scrollToBottomTapped {
+    self.stickToBottom = YES;
+    self.unreadCount = 0;
+    [self updateScrollToBottomButton];
+    [self scrollToBottomAnimated:YES];
+}
+
 #pragma mark - 历史分页
 
 - (void)updateHistoryHeader {
@@ -532,7 +794,12 @@ static const CGFloat IMStickToBottomThreshold = 90;
         header.onTap = ^{ [weakSelf loadOlderMessages]; };
         self.historyHeader = header;
     }
-    self.historyHeader.frame = CGRectMake(0, 0, self.tableView.bounds.size.width, 40);
+    // 宽度必须等表格真正布局完：首次进页面 bounds 还是 0，
+    // 用 0 宽度塞进 tableHeaderView 会让内部全 Auto Layout 的表头刷 unsatisfiable。
+    CGFloat width = self.tableView.bounds.size.width;
+    if (width <= 0) return;
+    self.lastHeaderWidth = width;
+    self.historyHeader.frame = CGRectMake(0, 0, width, 40);
     if (self.loadingOlder) {
         [self.historyHeader setState:@"正在加载更早的消息…" loading:YES];
     } else {
@@ -567,6 +834,7 @@ static const CGFloat IMStickToBottomThreshold = 90;
         }
         self.hasMoreOlder = hasMore;
         [self.transcript prependRecords:records];
+        [self rebuildDisplayRows];
         [self.tableView reloadData];
         self.lastRenderedItemCount = (NSInteger)self.transcript.items.count;
         [self.tableView layoutIfNeeded];
@@ -590,6 +858,8 @@ static const CGFloat IMStickToBottomThreshold = 90;
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
     if (scrollView != self.tableView) return;
     self.stickToBottom = [self isNearBottom];
+    if (self.stickToBottom) self.unreadCount = 0;
+    [self updateScrollToBottomButton];
     // 必须是用户真的在拖或惯性滚动才触发翻页：消息少时 contentOffset 天然贴着顶部，
     // 不判这两个标志会在每次布局/回弹时反复打 session/page。
     BOOL userScrolling = self.tableView.isDragging || self.tableView.isDecelerating;
@@ -599,25 +869,41 @@ static const CGFloat IMStickToBottomThreshold = 90;
 }
 
 - (void)scrollToBottomAnimated:(BOOL)animated {
-    NSInteger rows = (NSInteger)self.transcript.items.count;
+    NSInteger rows = (NSInteger)self.displayRows.count;
     if (rows == 0) return;
     NSIndexPath *last = [NSIndexPath indexPathForRow:rows - 1 inSection:0];
     [self.tableView layoutIfNeeded];
     [self.tableView scrollToRowAtIndexPath:last atScrollPosition:UITableViewScrollPositionBottom animated:animated];
+    self.unreadCount = 0;
+    [self updateScrollToBottomButton];
 }
 
 #pragma mark - UITableView
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return (NSInteger)self.transcript.items.count;
+    return (NSInteger)self.displayRows.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.row < 0 || indexPath.row >= (NSInteger)self.displayRows.count) {
+        return [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"IMBlankCell"];
+    }
+
+    IMConversationRow *row = self.displayRows[(NSUInteger)indexPath.row];
+    if (row.kind == IMConversationRowKindDaySeparator) {
+        IMDaySeparatorCell *cell = [tableView dequeueReusableCellWithIdentifier:@"IMDaySeparatorCell"
+                                                                  forIndexPath:indexPath];
+        [cell configureWithText:row.dayText];
+        return cell;
+    }
+
     IMMessageCell *cell = [tableView dequeueReusableCellWithIdentifier:@"IMMessageCell" forIndexPath:indexPath];
     cell.delegate = self;
-    if (indexPath.row < (NSInteger)self.transcript.items.count) {
-        [cell configureWithItem:self.transcript.items[(NSUInteger)indexPath.row]];
-    }
+    [cell configureWithItem:row.item
+                 showAvatar:row.showAvatar
+                   showTime:row.showTime
+               firstInGroup:row.firstInGroup
+                lastInGroup:row.lastInGroup];
     return cell;
 }
 

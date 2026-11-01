@@ -35,6 +35,28 @@ NS_ASSUME_NONNULL_BEGIN
 - (NSString *)displayTitle;
 /// 标题为空、且没跑过任何内容（空白会话）。
 - (BOOL)isEmptySession;
+/// 项目维度：主机给的 cwd 原值（空串表示未知项目）。
+@property (nonatomic, copy, readonly) NSString *projectKey;
+/// 项目显示名：cwd 尾段（如 dsh-webim）；未知时为「未指定项目」。
+@property (nonatomic, copy, readonly) NSString *projectName;
+
+@end
+
+#pragma mark - 会话分组
+
+/// 按项目（cwd）聚合出来的一组会话。列表页用它做「可折叠的项目分组」。
+@interface IMSessionGroup : NSObject
+
+@property (nonatomic, copy, readonly) NSString *projectKey;
+@property (nonatomic, copy, readonly) NSString *projectName;
+@property (nonatomic, strong, readonly) NSMutableArray<IMSessionRow *> *rows;
+/// 分组是否收起。
+@property (nonatomic, assign) BOOL collapsed;
+/// 组内最新一条的更新时间，用于组间排序。
+@property (nonatomic, assign, readonly) NSTimeInterval latestUpdate;
+
+/// 按项目分组：组内 updatedAt 倒序，组间按最新时间倒序。
++ (NSArray<IMSessionGroup *> *)groupsFromRows:(NSArray<IMSessionRow *> *)rows;
 
 @end
 

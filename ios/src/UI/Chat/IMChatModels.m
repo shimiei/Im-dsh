@@ -146,6 +146,73 @@ static NSString *IMOneLineSummary(NSString *text, NSUInteger limit) {
     return self.blank && [self.title stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length == 0;
 }
 
+- (NSString *)projectKey {
+    return self.cwd.length > 0 ? self.cwd : @"";
+}
+
+- (NSString *)projectName {
+    NSString *cwd = [self.cwd stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (cwd.length == 0) return @"未指定项目";
+
+    // Windows 主机给的是反斜杠路径，两种分隔符都要认。
+    NSString *tail = [cwd stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/\\"]];
+    NSRange slash = [tail rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"/\\"]
+                                          options:NSBackwardsSearch];
+    if (slash.location != NSNotFound) tail = [tail substringFromIndex:NSMaxRange(slash)];
+    return tail.length > 0 ? tail : cwd;
+}
+
+@end
+
+#pragma mark - IMSessionGroup
+
+@interface IMSessionGroup ()
+@property (nonatomic, copy, readwrite) NSString *projectKey;
+@property (nonatomic, copy, readwrite) NSString *projectName;
+@property (nonatomic, strong, readwrite) NSMutableArray<IMSessionRow *> *rows;
+@property (nonatomic, assign, readwrite) NSTimeInterval latestUpdate;
+@end
+
+@implementation IMSessionGroup
+
++ (NSArray<IMSessionGroup *> *)groupsFromRows:(NSArray<IMSessionRow *> *)rows {
+    NSMutableDictionary<NSString *, IMSessionGroup *> *byKey = [NSMutableDictionary dictionary];
+    NSMutableArray<NSString *> *order = [NSMutableArray array];
+
+    for (IMSessionRow *row in rows ?: @[]) {
+        NSString *key = row.projectKey;
+        IMSessionGroup *group = byKey[key];
+        if (group == nil) {
+            group = [IMSessionGroup new];
+            group.projectKey = key;
+            group.projectName = row.projectName;
+            group.rows = [NSMutableArray array];
+            byKey[key] = group;
+            [order addObject:key];
+        }
+        [group.rows addObject:row];
+    }
+
+    for (IMSessionGroup *group in byKey.allValues) {
+        [group.rows sortUsingComparator:^NSComparisonResult(IMSessionRow *lhs, IMSessionRow *rhs) {
+            if (lhs.updatedAt == rhs.updatedAt) return NSOrderedSame;
+            return lhs.updatedAt > rhs.updatedAt ? NSOrderedAscending : NSOrderedDescending;
+        }];
+        group.latestUpdate = group.rows.firstObject.updatedAt;
+    }
+
+    NSMutableArray<IMSessionGroup *> *groups = [NSMutableArray arrayWithCapacity:order.count];
+    for (NSString *key in order) {
+        IMSessionGroup *group = byKey[key];
+        if (group != nil) [groups addObject:group];
+    }
+    [groups sortUsingComparator:^NSComparisonResult(IMSessionGroup *lhs, IMSessionGroup *rhs) {
+        if (lhs.latestUpdate == rhs.latestUpdate) return NSOrderedSame;
+        return lhs.latestUpdate > rhs.latestUpdate ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    return groups;
+}
+
 @end
 
 #pragma mark - IMToolCallEntry
