@@ -307,6 +307,9 @@ static void IMCardRotateChevron(UIImageView *chevron, BOOL expanded) {
 
         _summaryLabel = IMCardLabel([IMTheme fontFootnote], IMTheme.shared.labelTertiary, 1);
         _summaryLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        // 必须挂到 self 上：下面要把它和 headerRow（self 的子视图）连约束，
+        // 曾经漏了这一行，导致「UILabel.top 与 UIStackView.bottom 无共同祖先」直接抛 NSGenericException。
+        [self addSubview:_summaryLabel];
 
         _headerButton = [UIButton buttonWithType:UIButtonTypeSystem];
         _headerButton.translatesAutoresizingMaskIntoConstraints = NO;
@@ -383,6 +386,10 @@ static void IMCardRotateChevron(UIImageView *chevron, BOOL expanded) {
         [self rebuildDetailWithArguments:entry.prettyArguments ?: entry.argumentsText
                                   result:entry.prettyResult ?: entry.resultText];
         [self preparePrettyTextIfNeeded];
+    } else {
+        // 收起态要把明细真正清空：hidden 只是不绘制，约束照样占高度，
+        // 而 UIStackView 会把「隐藏的排列子视图」连同间距一起折叠掉，所以清空即收拢。
+        [self rebuildDetailWithArguments:nil result:nil];
     }
 }
 
